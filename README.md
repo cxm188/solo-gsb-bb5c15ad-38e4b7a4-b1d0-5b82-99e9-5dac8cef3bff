@@ -448,7 +448,10 @@ schedule/workOrder 不一致（刀次缺来源批次、与排程批次成员不�
    （可填写来源批次号，留空自动生成）。服务端自动识别结果形态：
    单张 / 方案比选（登记中选方案；全部排不进时登记首个候选）、批量排产（逐张）、
    多纸型成本排产（解包每张 `layout`，纸型名称与轮次随记录透传）。
-   **同一来源批次下纸型、刀缝、坐标、尺寸完全相同的余料不重复登记**（跨请求重复提交同样去重）；
+   **同一来源批次下纸型、刀缝、坐标、尺寸完全相同的余料不重复登记**（跨请求重复提交同样去重）。
+   登记是**原子**的：先校验全部待登记余料，再按来源指纹去重，最后一次性写入——
+   任一余料无效（如越出纸面）时整批不写入，库存、预占状态与自动生成的余料/批次
+   序号均不变，修正后重试不会出现跳过记录或编号错位；
 2. **手工录入**：在余料页填写纸型名称、余料宽高、纸张纹向、刀缝、来源批次与订单号
    （无原纸面坐标的余料坐标取 0,0，刀缝缺省 0，纹向缺省沿宽）。
 
@@ -605,7 +608,7 @@ npm start          # 默认 http://localhost:3000，可用 PORT=8080 npm start �
 ### 余料库存与复用预占
 
 - `POST /api/offcuts` — 手工录入一条余料（`paperName?`、`width`、`height`、`paperGrain?`、`kerf?`、`batchId?`、`orderNo?`；返回余料记录与库存汇总，HTTP 201）
-- `POST /api/offcuts/ingest` — 从现有排料结果批量登记（`layout` 传单张 / 比选 / 批量 / 多纸型成本返回；`batchId?` 来源批次号，缺省自动生成；同批次相同余料去重，返回 `ingested`/`skipped`/`offcutIds`）
+- `POST /api/offcuts/ingest` — 从现有排料结果批量登记（`layout` 传单张 / 比选 / 批量 / 多纸型成本返回；`batchId?` 来源批次号，缺省自动生成；同批次相同余料去重，返回 `ingested`/`skipped`/`offcutIds`；**原子登记**——任一余料无效时整批不写入、不消耗自动序号，HTTP 400）
 - `GET /api/offcuts` — 余料查询（`status=all|available|reserved`、`minW`/`minH` 最小可容纳尺寸、`grain` 纸张纹向、`q` 关键字；返回 `summary` 与余料明细）
 - `POST /api/offcuts/allocate` — 复用预占（`width`、`height`、`quantity`、`grain?`、`ref?`；成功返回 `status:'fulfilled'`、`allocationId` 与 `reserved` 明细；缺口返回 `status:'shortfall'`、`shortfall`、`blockedBySize`、`blockedGrain`、`unavailableReserved` 与可行候选，**不改动任何记录**，HTTP 200）
 - `POST /api/offcuts/release` — 释放预占（`allocationIds?` 预占单号数组或 `offcutIds?` 余料编号数组；成功返回释放块数与库存汇总，编号非法 / 未预占返回 HTTP 400）

@@ -6,7 +6,9 @@
  * 把排料结果中每张纸 layout.frees 的自由矩形标准化为可追踪的余料记录
  * （保留纸型宽高/名称、纸张纹向、刀缝、纸面坐标、尺寸与来源批次），
  * 支持：
- *  - 余料录入（手工录入 / 从单张、批量、多纸型成本、方案比选结果批量登记）；
+ *  - 余料录入（手工录入 / 从单张、批量、多纸型成本、方案比选结果批量登记；
+ *    批量登记先校验全部待登记余料，再按来源指纹去重，最后一次性写入——
+ *    任一余料无效时库存、预占状态与自动生成的余料/批次序号均不变）；
  *  - 余料查询（可用 / 已预占、最小尺寸、关键字）；
  *  - POST /api/offcuts/allocate 原子复用预占：给定成品宽高、数量与纹向要求，
  *    按旋转 / 纹向可行性与“占用后剩余面积最小”确定性选取余料；
@@ -88,12 +90,17 @@ function normalizeRef(value, subject = '关联单据') {
   return s;
 }
 
-function normalizeBatchId(value) {
-  if (value == null || value === '') return newBatchId();
+/** 校验显式来源批次号；未提供时返回 null（是否自动生成由调用方决定时机） */
+function explicitBatchId(value) {
+  if (value == null || value === '') return null;
   const s = String(value).trim();
-  if (!s) return newBatchId();
+  if (!s) return null;
   if (s.length > 128) throw new Error('来源批次号长度不能超过 128 个字符');
   return s;
+}
+
+function normalizeBatchId(value) {
+  return explicitBatchId(value) || newBatchId();
 }
 
 /** 规范化单条余料的纸型 / 几何字段（手工录入与结果登记共用） */
@@ -109,12 +116,12 @@ function normalizeOffcutShape(raw, pos) {
 /* ---------------- 记录构造 ---------------- */
 
 /**
- * 把一个自由矩形标准化为余料记录。
+ * 校验并规范化一个自由矩形的坐标与尺寸（纯校验，不取号、不写库）。
  * @param {object} free { x, y, w, h }（layout.frees 元素）
- * @param {object} paper { width, height, kerf, grain }（layout.paper）
- * @param {object} meta { type, batchId, sheetIndex, round, paperId, paperName, orderNo }
+ * @param {object} paper { width, height }（已规范化的纸张）
+ * @returns {{ x:number, y:number, w:number, h:number }}
  */
-function buildRecordFromFree(free, paper, meta) {
+function normalizeFreeRect(free, paper) {
   const x = Number(free.x) || 0;
   const y = Number(free.y) || 0;
   const w = positiveNumber(free.w, '余料宽度');
@@ -123,9 +130,21 @@ function buildRecordFromFree(free, paper, meta) {
   if (x + w > paper.width + EPS || y + h > paper.height + EPS) {
     throw new Error('余料矩形超出纸面范围');
   }
-  const id = newOffcutId();
+  return { x, y, w, h };
+}
+
+/**
+ * 由已校验的自由矩形构造余料记录。
+ * id 留空（null），由调用方在确定入库时通过 newOffcutId() 赋值，
+ * 保证跳过的重复项与校验失败的批次不消耗余料序号。
+ * @param {object} rect { x, y, w, h }（normalizeFreeRect 返回）
+ * @param {object} paper { width, height, kerf, grain }
+ * @param {object} meta { type, batchId, sheetIndex, round, paperId, paperName, orderNo }
+ */
+function buildRecord(rect, paper, meta) {
+  const { x, y, w, h } = rect;
   return {
-    id,
+    id: null,
     paperName: meta.paperName || null,
     paperWidth: round3(paper.width),
     paperHeight: round3(paper.height),
@@ -150,19 +169,36 @@ function buildRecordFromFree(free, paper, meta) {
   };
 }
 
+/**
+ * 把一个自由矩形标准化为余料记录（校验 + 取号，供确定入库的路径使用）。
+ * @param {object} free { x, y, w, h }（layout.frees 元素）
+ * @param {object} paper { width, height, kerf, grain }（layout.paper）
+ * @param {object} meta { type, batchId, sheetIndex, round, paperId, paperName, orderNo }
+ */
+function buildRecordFromFree(free, paper, meta) {
+  const rec = buildRecord(normalizeFreeRect(free, paper), paper, meta);
+  rec.id = newOffcutId();
+  return rec;
+}
+
 /* ---------------- 从排料结果登记 ---------------- */
 
-/** 从单张 layout() 结果提取余料记录 */
-function offcutsFromLayout(layoutResult, meta) {
+/** 规范化排料结果中的纸张信息（单张 / 批量 / 成本 / 比选登记共用） */
+function normalizeLayoutPaper(layoutResult) {
   if (!layoutResult || typeof layoutResult !== 'object' || !layoutResult.paper) {
     throw new Error('缺少有效的单张排料结果（需包含 paper 与 frees）');
   }
-  const paper = {
+  return {
     width: positiveNumber(layoutResult.paper.width, '纸张宽度'),
     height: positiveNumber(layoutResult.paper.height, '纸张高度'),
     kerf: layoutResult.paper.kerf == null ? 0 : nonNegativeNumber(layoutResult.paper.kerf, '刀缝宽度'),
     grain: normalizePaperGrain(layoutResult.paper.grain, '纸张'),
   };
+}
+
+/** 从单张 layout() 结果提取余料记录 */
+function offcutsFromLayout(layoutResult, meta) {
+  const paper = normalizeLayoutPaper(layoutResult);
   const frees = Array.isArray(layoutResult.frees) ? layoutResult.frees : [];
   return frees.map((free) => buildRecordFromFree(free, paper, meta));
 }
@@ -188,6 +224,11 @@ function detectResultShape(raw) {
  * 也可直接把单张 / 批量 / 成本 / 比选返回作为请求体。
  * 同一来源批次（batchId）下纸型、刀缝、坐标、尺寸完全相同的余料不重复登记。
  *
+ * 原子性：先校验全部待登记余料（任一无效即整体报错），再按来源指纹
+ * 处理库内与本次请求内的重复项，最后一次性取号写入；任一余料无效时
+ * 库存、预占状态与自动生成的余料/批次序号均不变，修正后重试不会出现
+ * 跳过记录或编号错位。
+ *
  * @returns {{ batchId, ingested:number, skipped:number, offcutIds:string[] }}
  */
 function ingestOffcuts(input) {
@@ -197,13 +238,15 @@ function ingestOffcuts(input) {
   if (!shape) {
     throw new Error('无法识别排料结果（需为单张 layout.frees、批量/成本 sheets 或方案比选 candidates）');
   }
-  const batchId = normalizeBatchId(input.batchId);
+  // 显式批次号先校验格式；缺省时的自动批次号留待全部校验通过后再取号，
+  // 保证任一余料无效时批次序号不前进
+  const givenBatchId = explicitBatchId(input.batchId);
 
-  const plans = []; // [{ layout, meta }]
+  const plans = []; // [{ layout, meta }]（meta.batchId 待批次号确定后统一填入）
   if (shape === 'single') {
     plans.push({
       layout: raw,
-      meta: { type: 'single', batchId, sheetIndex: 1 },
+      meta: { type: 'single', sheetIndex: 1 },
     });
   } else if (shape === 'compare') {
     // 方案比选：登记中选方案；全部排不进（best 为 null）时登记首个候选
@@ -213,14 +256,14 @@ function ingestOffcuts(input) {
     if (!chosen) throw new Error('方案比选结果中没有可登记的布局');
     plans.push({
       layout: chosen,
-      meta: { type: 'single', batchId, sheetIndex: 1 },
+      meta: { type: 'single', sheetIndex: 1 },
     });
   } else if (shape === 'batch') {
     raw.sheets.forEach((sh, i) => {
       plans.push({
         layout: sh,
         meta: {
-          type: 'batch', batchId, sheetIndex: i + 1,
+          type: 'batch', sheetIndex: i + 1,
           round: sh.round || i + 1, orderNo: sh.orderNo == null ? null : sh.orderNo,
         },
       });
@@ -230,7 +273,7 @@ function ingestOffcuts(input) {
       plans.push({
         layout: sh.layout,
         meta: {
-          type: 'cost', batchId, sheetIndex: i + 1,
+          type: 'cost', sheetIndex: i + 1,
           round: sh.round, paperId: sh.paperId, paperName: sh.paperName,
           orderNo: sh.orderNo == null ? null : sh.orderNo,
         },
@@ -238,27 +281,44 @@ function ingestOffcuts(input) {
     });
   }
 
-  // 同一来源（批次 + 纸张序号）下纸型、刀缝、坐标、尺寸完全相同的
-  // 余料不重复登记；跨请求对同一 batchId 重复提交同样去重
+  // 第一阶段：校验全部纸张与待登记余料（纯校验，不取号、不写库）
+  const pending = []; // [{ rect, paper, meta }]
+  for (const plan of plans) {
+    const paper = normalizeLayoutPaper(plan.layout);
+    const frees = Array.isArray(plan.layout.frees) ? plan.layout.frees : [];
+    for (const free of frees) {
+      pending.push({ rect: normalizeFreeRect(free, paper), paper, meta: plan.meta });
+    }
+  }
+
+  // 全部校验通过后才确定来源批次号（缺省时此刻才消耗自动批次序号）
+  const batchId = givenBatchId || newBatchId();
+
+  // 第二阶段：同一来源（批次 + 纸张序号）下纸型、刀缝、坐标、尺寸完全相同的
+  // 余料不重复登记；跨请求对同一 batchId 重复提交同样去重（保持原有登记顺序）
   const fingerprints = new Set();
   for (const rec of store.offcuts.values()) fingerprints.add(fingerprintOf(rec));
 
   const seen = new Set(); // 本次请求内的指纹（与库内指纹一并判重）
-  const ingested = [];
+  const accepted = [];
   let skipped = 0;
-  for (const plan of plans) {
-    const records = offcutsFromLayout(plan.layout, plan.meta);
-    for (const rec of records) {
-      const fp = fingerprintOf(rec);
-      if (seen.has(fp) || fingerprints.has(fp)) {
-        skipped += 1;
-        continue;
-      }
-      seen.add(fp);
-      fingerprints.add(fp);
-      store.offcuts.set(rec.id, rec);
-      ingested.push(rec);
+  for (const item of pending) {
+    const rec = buildRecord(item.rect, item.paper, { ...item.meta, batchId });
+    const fp = fingerprintOf(rec);
+    if (seen.has(fp) || fingerprints.has(fp)) {
+      skipped += 1;
+      continue;
     }
+    seen.add(fp);
+    accepted.push(rec);
+  }
+
+  // 第三阶段：一次性取号写入（只有确定入库的记录才消耗余料序号）
+  const ingested = [];
+  for (const rec of accepted) {
+    rec.id = newOffcutId();
+    store.offcuts.set(rec.id, rec);
+    ingested.push(rec);
   }
 
   return {

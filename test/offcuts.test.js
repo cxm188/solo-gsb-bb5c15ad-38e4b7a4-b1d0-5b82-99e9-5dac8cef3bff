@@ -361,6 +361,93 @@ test('释放与再预占：释放后余料可再次被选中', () => {
   assert.equal(again.reserved[0].offcutId, first.reserved[0].offcutId);
 });
 
+/* ---------------- 批量登记原子性 ---------------- */
+
+test('批量登记原子性：后一张余料越界时整批不写入，序号不前进，重试无跳过/错位', () => {
+  const goodSheet = {
+    paper: { width: 200, height: 100, kerf: 0, grain: 'along-width' },
+    frees: [{ x: 0, y: 0, w: 50, h: 40 }],
+  };
+  const badSheet = {
+    paper: { width: 200, height: 100, kerf: 0, grain: 'along-width' },
+    frees: [{ x: 150, y: 0, w: 60, h: 40 }], // 150+60=210 越出纸面
+  };
+  // 缺省批次号：失败不得消耗批次序号与余料序号
+  assert.throws(
+    () => ingestOffcuts({ layout: { sheets: [goodSheet, badSheet] } }),
+    /超出纸面/
+  );
+  assert.equal(listOffcuts().count, 0);
+
+  // 修正后重试：无跳过记录、余料编号从 1 开始、批次号也是第 1 个
+  const retry = ingestOffcuts({ layout: { sheets: [goodSheet] } });
+  assert.equal(retry.ingested, 1);
+  assert.equal(retry.skipped, 0);
+  assert.deepEqual(retry.offcutIds, ['OC-000001']);
+  assert.equal(retry.batchId, 'BATCH-000001');
+});
+
+test('单张 / 多纸型 / 比选登记同样原子：任一余料无效整批不写入', () => {
+  const paper = { width: 200, height: 100, kerf: 0, grain: 'along-width' };
+  const valid = { x: 0, y: 0, w: 50, h: 40 };
+  const invalid = { x: 180, y: 0, w: 50, h: 40 }; // 180+50=230 越出纸面
+
+  // 单张：frees 中后一条无效
+  assert.throws(
+    () => ingestOffcuts({ layout: { paper, frees: [valid, invalid] } }),
+    /超出纸面/
+  );
+  assert.equal(listOffcuts().count, 0);
+
+  // 多纸型成本：第二张纸的 layout 含无效余料
+  const costResult = {
+    sheets: [
+      { round: 1, paperId: 'P1', paperName: '大纸', layout: { paper, frees: [valid] } },
+      { round: 2, paperId: 'P2', paperName: '小纸', layout: { paper, frees: [invalid] } },
+    ],
+  };
+  assert.throws(() => ingestOffcuts({ layout: costResult }), /超出纸面/);
+  assert.equal(listOffcuts().count, 0);
+
+  // 方案比选：中选布局含无效余料
+  const compare = { best: { layout: { paper, frees: [invalid] } }, candidates: [] };
+  assert.throws(() => ingestOffcuts({ layout: compare }), /超出纸面/);
+  assert.equal(listOffcuts().count, 0);
+
+  // 全部失败后序号未消耗：手工录入仍从 OC-000001 开始
+  const { offcut } = createOffcut({ width: 10, height: 10 });
+  assert.equal(offcut.id, 'OC-000001');
+});
+
+test('登记失败不影响已预占状态；显式批次号重试不产生跳过记录', () => {
+  createOffcut({ width: 300, height: 300 });
+  const alloc = allocateOffcuts({ width: 100, height: 100, quantity: 1 });
+  assert.equal(alloc.status, 'fulfilled');
+
+  const sheet = {
+    paper: { width: 200, height: 100, kerf: 0, grain: 'along-width' },
+    frees: [{ x: 0, y: 0, w: 50, h: 40 }],
+  };
+  const badSheet = {
+    paper: { width: 200, height: 100, kerf: 0, grain: 'along-width' },
+    frees: [{ x: 0, y: 0, w: 500, h: 40 }], // 越出纸面
+  };
+  const before = listOffcuts();
+  assert.throws(
+    () => ingestOffcuts({ layout: { sheets: [sheet, badSheet] }, batchId: 'RETRY-1' }),
+    /超出纸面/
+  );
+  // 库存与预占状态完全不变
+  assert.deepEqual(listOffcuts(), before);
+  assert.equal(listOffcuts({ status: 'reserved' }).count, 1);
+
+  // 同一显式批次号修正后重试：第一张纸的余料未被“登记过”，无跳过、编号连续
+  const retry = ingestOffcuts({ layout: { sheets: [sheet] }, batchId: 'RETRY-1' });
+  assert.equal(retry.ingested, 1);
+  assert.equal(retry.skipped, 0);
+  assert.deepEqual(retry.offcutIds, ['OC-000002']); // 手工录入占 1 号，失败未消耗序号
+});
+
 /* ---------------- 去重与确定性 ---------------- */
 
 test('同批次同自由矩形重复登记去重，不同批次保留', () => {
