@@ -7,6 +7,9 @@
  * （保留纸型宽高/名称、纸张纹向、刀缝、纸面坐标、尺寸与来源批次），
  * 支持：
  *  - 余料录入（手工录入 / 从单张、批量、多纸型成本、方案比选结果批量登记）；
+ *    批量登记为原子操作：先统一校验全部待登记余料，任一无效则整体失败——
+ *    库存、预占状态与自动生成的余料/批次序号均不变，修正后重试
+ *    不会出现跳过记录或编号错位；全部有效时按来源指纹去重后一次性写入；
  *  - 余料查询（可用 / 已预占、最小尺寸、关键字）；
  *  - POST /api/offcuts/allocate 原子复用预占：给定成品宽高、数量与纹向要求，
  *    按旋转 / 纹向可行性与“占用后剩余面积最小”确定性选取余料；
@@ -96,6 +99,19 @@ function normalizeBatchId(value) {
   return s;
 }
 
+/**
+ * 校验显式提供的来源批次号；未提供时返回 null。
+ * 批量登记据此把自动生成批次号推迟到全部余料校验通过之后，
+ * 保证登记失败不消耗批次序号。
+ */
+function normalizeProvidedBatchId(value) {
+  if (value == null || value === '') return null;
+  const s = String(value).trim();
+  if (!s) return null;
+  if (s.length > 128) throw new Error('来源批次号长度不能超过 128 个字符');
+  return s;
+}
+
 /** 规范化单条余料的纸型 / 几何字段（手工录入与结果登记共用） */
 function normalizeOffcutShape(raw, pos) {
   const who = pos ? `第 ${pos} 条余料的` : '';
@@ -108,13 +124,8 @@ function normalizeOffcutShape(raw, pos) {
 
 /* ---------------- 记录构造 ---------------- */
 
-/**
- * 把一个自由矩形标准化为余料记录。
- * @param {object} free { x, y, w, h }（layout.frees 元素）
- * @param {object} paper { width, height, kerf, grain }（layout.paper）
- * @param {object} meta { type, batchId, sheetIndex, round, paperId, paperName, orderNo }
- */
-function buildRecordFromFree(free, paper, meta) {
+/** 校验自由矩形几何（尺寸为正、坐标非负、不越出纸面）并返回数值坐标尺寸（纯函数） */
+function normalizeFreeRect(free, paper) {
   const x = Number(free.x) || 0;
   const y = Number(free.y) || 0;
   const w = positiveNumber(free.w, '余料宽度');
@@ -123,6 +134,17 @@ function buildRecordFromFree(free, paper, meta) {
   if (x + w > paper.width + EPS || y + h > paper.height + EPS) {
     throw new Error('余料矩形超出纸面范围');
   }
+  return { x, y, w, h };
+}
+
+/**
+ * 把一个自由矩形标准化为余料记录。
+ * @param {object} free { x, y, w, h }（layout.frees 元素）
+ * @param {object} paper { width, height, kerf, grain }（layout.paper）
+ * @param {object} meta { type, batchId, sheetIndex, round, paperId, paperName, orderNo }
+ */
+function buildRecordFromFree(free, paper, meta) {
+  const { x, y, w, h } = normalizeFreeRect(free, paper);
   const id = newOffcutId();
   return {
     id,
@@ -152,17 +174,29 @@ function buildRecordFromFree(free, paper, meta) {
 
 /* ---------------- 从排料结果登记 ---------------- */
 
-/** 从单张 layout() 结果提取余料记录 */
-function offcutsFromLayout(layoutResult, meta) {
+/** 校验并规范化单张排料结果的纸型参数（纯函数：不分配编号、不写库存） */
+function normalizeLayoutPaper(layoutResult) {
   if (!layoutResult || typeof layoutResult !== 'object' || !layoutResult.paper) {
     throw new Error('缺少有效的单张排料结果（需包含 paper 与 frees）');
   }
-  const paper = {
+  return {
     width: positiveNumber(layoutResult.paper.width, '纸张宽度'),
     height: positiveNumber(layoutResult.paper.height, '纸张高度'),
     kerf: layoutResult.paper.kerf == null ? 0 : nonNegativeNumber(layoutResult.paper.kerf, '刀缝宽度'),
     grain: normalizePaperGrain(layoutResult.paper.grain, '纸张'),
   };
+}
+
+/** 统一校验一张待登记纸张的纸型与全部余料（纯校验，供批量登记的第一阶段使用） */
+function validateLayoutOffcuts(layoutResult) {
+  const paper = normalizeLayoutPaper(layoutResult);
+  const frees = Array.isArray(layoutResult.frees) ? layoutResult.frees : [];
+  for (const free of frees) normalizeFreeRect(free, paper);
+}
+
+/** 从单张 layout() 结果提取余料记录 */
+function offcutsFromLayout(layoutResult, meta) {
+  const paper = normalizeLayoutPaper(layoutResult);
   const frees = Array.isArray(layoutResult.frees) ? layoutResult.frees : [];
   return frees.map((free) => buildRecordFromFree(free, paper, meta));
 }
@@ -188,6 +222,10 @@ function detectResultShape(raw) {
  * 也可直接把单张 / 批量 / 成本 / 比选返回作为请求体。
  * 同一来源批次（batchId）下纸型、刀缝、坐标、尺寸完全相同的余料不重复登记。
  *
+ * 原子性：先统一校验全部待登记余料，任一无效即整体失败——库存、预占状态
+ * 与自动生成的余料/批次序号均不变；全部有效时才生成批次号、分配余料编号，
+ * 按来源指纹去重后一次性写入。
+ *
  * @returns {{ batchId, ingested:number, skipped:number, offcutIds:string[] }}
  */
 function ingestOffcuts(input) {
@@ -197,13 +235,14 @@ function ingestOffcuts(input) {
   if (!shape) {
     throw new Error('无法识别排料结果（需为单张 layout.frees、批量/成本 sheets 或方案比选 candidates）');
   }
-  const batchId = normalizeBatchId(input.batchId);
+  // 显式批次号先校验；未提供时推迟到全部余料校验通过后再自动生成
+  const providedBatchId = normalizeProvidedBatchId(input.batchId);
 
-  const plans = []; // [{ layout, meta }]
+  const plans = []; // [{ layout, meta }]（meta.batchId 在提交阶段统一填入）
   if (shape === 'single') {
     plans.push({
       layout: raw,
-      meta: { type: 'single', batchId, sheetIndex: 1 },
+      meta: { type: 'single', sheetIndex: 1 },
     });
   } else if (shape === 'compare') {
     // 方案比选：登记中选方案；全部排不进（best 为 null）时登记首个候选
@@ -213,14 +252,14 @@ function ingestOffcuts(input) {
     if (!chosen) throw new Error('方案比选结果中没有可登记的布局');
     plans.push({
       layout: chosen,
-      meta: { type: 'single', batchId, sheetIndex: 1 },
+      meta: { type: 'single', sheetIndex: 1 },
     });
   } else if (shape === 'batch') {
     raw.sheets.forEach((sh, i) => {
       plans.push({
         layout: sh,
         meta: {
-          type: 'batch', batchId, sheetIndex: i + 1,
+          type: 'batch', sheetIndex: i + 1,
           round: sh.round || i + 1, orderNo: sh.orderNo == null ? null : sh.orderNo,
         },
       });
@@ -230,7 +269,7 @@ function ingestOffcuts(input) {
       plans.push({
         layout: sh.layout,
         meta: {
-          type: 'cost', batchId, sheetIndex: i + 1,
+          type: 'cost', sheetIndex: i + 1,
           round: sh.round, paperId: sh.paperId, paperName: sh.paperName,
           orderNo: sh.orderNo == null ? null : sh.orderNo,
         },
@@ -238,6 +277,15 @@ function ingestOffcuts(input) {
     });
   }
 
+  // 第一阶段：统一校验全部纸张的待登记余料（纯校验，不分配编号、不写库存）。
+  // 任一余料无效即在此抛错——库存、预占状态与余料/批次序号均不变。
+  for (const plan of plans) validateLayoutOffcuts(plan.layout);
+
+  // 全部有效：此时才确定来源批次号（未显式提供时自动生成）
+  const batchId = providedBatchId || newBatchId();
+  for (const plan of plans) plan.meta.batchId = batchId;
+
+  // 第二阶段：构造记录并按现有来源指纹处理库内与本次重复项（顺序不变）。
   // 同一来源（批次 + 纸张序号）下纸型、刀缝、坐标、尺寸完全相同的
   // 余料不重复登记；跨请求对同一 batchId 重复提交同样去重
   const fingerprints = new Set();
@@ -256,10 +304,12 @@ function ingestOffcuts(input) {
       }
       seen.add(fp);
       fingerprints.add(fp);
-      store.offcuts.set(rec.id, rec);
       ingested.push(rec);
     }
   }
+
+  // 第三阶段：全部记录有效且去重完毕，一次性写入库存
+  for (const rec of ingested) store.offcuts.set(rec.id, rec);
 
   return {
     batchId,

@@ -388,3 +388,114 @@ test('编号单调且多次预占/释放顺序确定', () => {
   assert.notEqual(a.allocationId, b.allocationId);
   assert.ok(b.allocationId > a.allocationId);
 });
+
+/* ---------------- 批量登记原子性 ---------------- */
+
+test('登记原子性：批量结果后一张余料越界时整体失败，修正重试无跳过、编号不错位', () => {
+  const sheet1 = {
+    paper: { width: 300, height: 200, kerf: 2, grain: 'along-width' },
+    frees: [{ x: 0, y: 0, w: 100, h: 50 }, { x: 100, y: 0, w: 80, h: 60 }],
+  };
+  const badSheet2 = {
+    paper: { width: 300, height: 200, kerf: 2, grain: 'along-width' },
+    frees: [{ x: 250, y: 150, w: 100, h: 100 }], // 越出纸面
+  };
+  assert.throws(
+    () => ingestOffcuts({ layout: { sheets: [sheet1, badSheet2] }, batchId: 'ATOMIC' }),
+    /超出纸面范围/
+  );
+  // 库存未写入任何记录（前一张的有效余料不得入库）
+  assert.equal(listOffcuts().count, 0);
+  assert.equal(offcuts.inventorySummary().total, 0);
+
+  // 修正后按同一批次号重试：无跳过记录，余料编号从 OC-000001 连续不错位
+  const goodSheet2 = {
+    paper: { width: 300, height: 200, kerf: 2, grain: 'along-width' },
+    frees: [{ x: 0, y: 0, w: 90, h: 40 }],
+  };
+  const out = ingestOffcuts({ layout: { sheets: [sheet1, goodSheet2] }, batchId: 'ATOMIC' });
+  assert.equal(out.shape, 'batch');
+  assert.equal(out.ingested, 3);
+  assert.equal(out.skipped, 0);
+  assert.deepEqual(out.offcutIds, ['OC-000001', 'OC-000002', 'OC-000003']);
+  assert.equal(listOffcuts().count, 3);
+});
+
+test('登记原子性：失败不消耗自动生成的批次号与余料序号', () => {
+  const badSingle = {
+    paper: { width: 200, height: 100 },
+    frees: [{ x: 0, y: 0, w: 50, h: 50 }, { x: 150, y: 50, w: 100, h: 100 }], // 第二条越界
+  };
+  assert.throws(() => ingestOffcuts({ layout: badSingle }), /超出纸面范围/);
+  assert.equal(listOffcuts().count, 0);
+
+  const ok = ingestOffcuts({
+    layout: { paper: { width: 200, height: 100 }, frees: [{ x: 0, y: 0, w: 50, h: 50 }] },
+  });
+  assert.equal(ok.batchId, 'BATCH-000001'); // 失败未消耗批次序号
+  assert.deepEqual(ok.offcutIds, ['OC-000001']); // 失败未消耗余料序号
+});
+
+test('登记原子性：多纸型成本结果任一纸张余料无效则整体不写入', () => {
+  const cost = {
+    sheets: [
+      {
+        round: 1, paperId: 'P1', paperName: '大纸',
+        layout: {
+          paper: { width: 500, height: 400, kerf: 0, grain: 'along-width' },
+          frees: [{ x: 0, y: 0, w: 200, h: 100 }],
+        },
+      },
+      {
+        round: 2, paperId: 'P2', paperName: '小纸',
+        layout: {
+          paper: { width: 300, height: 200, kerf: 0, grain: 'along-height' },
+          frees: [{ x: 0, y: 0, w: 400, h: 100 }], // 越出纸面
+        },
+      },
+    ],
+  };
+  assert.throws(() => ingestOffcuts({ layout: cost, batchId: 'C-1' }), /超出纸面范围/);
+  assert.equal(listOffcuts().count, 0);
+  assert.equal(offcuts.inventorySummary().total, 0);
+});
+
+test('登记原子性：比选结果候选余料无效时不写入任何记录', () => {
+  const compare = {
+    best: null,
+    candidates: [
+      {
+        strategy: 'area-desc',
+        layout: { paper: { width: 100, height: 100 }, frees: [{ x: 0, y: 0, w: 200, h: 10 }] },
+      },
+    ],
+  };
+  assert.throws(() => ingestOffcuts({ layout: compare }), /超出纸面范围/);
+  assert.equal(listOffcuts().count, 0);
+});
+
+test('登记原子性：失败不影响库存中已预占记录', () => {
+  createOffcut({ width: 300, height: 300 });
+  const alloc = allocateOffcuts({ width: 100, height: 100, quantity: 1 });
+  assert.equal(alloc.status, 'fulfilled');
+  const before = listOffcuts();
+
+  assert.throws(() => ingestOffcuts({
+    layout: {
+      sheets: [
+        { paper: { width: 100, height: 100 }, frees: [{ x: 0, y: 0, w: 40, h: 40 }] },
+        { paper: { width: 100, height: 100 }, frees: [{ x: 50, y: 50, w: 100, h: 100 }] },
+      ],
+    },
+  }), /超出纸面范围/);
+
+  const after = listOffcuts();
+  assert.deepEqual(
+    after.offcuts.map((o) => [o.id, o.status]),
+    before.offcuts.map((o) => [o.id, o.status])
+  );
+  assert.equal(after.summary.total, 1);
+  assert.equal(after.summary.reserved, 1);
+  const rec = listOffcuts({ status: 'reserved' }).offcuts[0];
+  assert.equal(rec.reservation.allocationId, alloc.allocationId);
+});
